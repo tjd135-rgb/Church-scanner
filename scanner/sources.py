@@ -42,6 +42,19 @@ class Layer:
     supports_pagination: bool
     max_record_count: int
 
+    @property
+    def supports_geojson_output(self) -> bool:
+        """Does this layer advertise geoJSON in its supportedQueryFormats?
+
+        Large enterprise FeatureServer instances (e.g. FGIO Statewide
+        Cadastral, ~10M parcels) commonly restrict output to `JSON,AMF`
+        and reject f=geojson with a generic 'Unable to perform query.
+        Please check your parameters.' 400 — the same message the user's
+        run produced. We look at the metadata rather than trial-and-
+        erroring the query."""
+        fmts = str(self.metadata.get("supportedQueryFormats") or "")
+        return "geojson" in fmts.lower()
+
     def field_type(self, canonical: str) -> str | None:
         """Esri field type (e.g. esriFieldTypeString) for a canonical name.
 
@@ -153,8 +166,12 @@ class ArcGISClient:
                     "supportsPagination", meta.get("supportsPagination", True)
                 ))
                 max_rc = int(meta.get("maxRecordCount", self.page_size))
-                log.info("layer resolved: %s (fields mapped: %d, unresolved: %s)",
-                         url, len(fm.mapping), fm.unresolved)
+                log.info(
+                    "layer resolved: %s (fields mapped: %d, unresolved: %s, "
+                    "supportedQueryFormats=%r)",
+                    url, len(fm.mapping), fm.unresolved,
+                    meta.get("supportedQueryFormats"),
+                )
                 return Layer(
                     url=url, metadata=meta, field_map=fm,
                     supports_pagination=supports_pag,
@@ -202,8 +219,14 @@ class ArcGISClient:
         """
         page_size = min(self.page_size, layer.max_record_count or self.page_size)
         of_str = "*" if not out_fields else ",".join(sorted(set(out_fields)))
+        # Only ask for f=geojson if the layer explicitly advertises it in
+        # supportedQueryFormats. Large FeatureServer instances (like the
+        # FGIO statewide layer) support only JSON+AMF and return a generic
+        # 400 for f=geojson — the exact symptom we're chasing. Esri JSON
+        # is universal; we convert the geometry ourselves in _paged().
+        wants_geojson = return_geometry and layer.supports_geojson_output
         base_params: dict[str, Any] = {
-            "f": "geojson" if return_geometry else "json",
+            "f": "geojson" if wants_geojson else "json",
             "where": where,
             "outFields": of_str,
             "outSR": out_sr,
@@ -249,12 +272,16 @@ class ArcGISClient:
     ) -> list[dict]:
         features: list[dict] = []
         offset = 0
+        is_esri_json = base_params.get("f") == "json"
         while True:
             params = dict(base_params)
             params["resultOffset"] = offset
             params["resultRecordCount"] = page_size
             data = self._get(f"{layer.url}/query", params=params)
-            batch = data.get("features", []) or []
+            if is_esri_json:
+                batch = _esri_features_to_geojson(data)
+            else:
+                batch = data.get("features", []) or []
             features.extend(batch)
             log.info(
                 "  page: %s+%d (offset %d, total %d)",
@@ -331,3 +358,42 @@ def _polygon_to_envelope(esri_geom: dict) -> dict:
             "spatialReference", {"wkid": 4326}
         ),
     }
+
+
+def _esri_features_to_geojson(response: dict) -> list[dict]:
+    """Convert an Esri JSON query response (features[].attributes +
+    features[].geometry.rings/paths/points) into GeoJSON-style Feature
+    dicts (properties + geometry) so the extractor's _canonicalize can
+    read either format without branching."""
+    out: list[dict] = []
+    for feat in response.get("features") or []:
+        props = feat.get("attributes") or {}
+        egeom = feat.get("geometry")
+        gjson_geom = _esri_geom_to_geojson(egeom) if egeom else None
+        out.append({"type": "Feature", "properties": props,
+                    "geometry": gjson_geom})
+    return out
+
+
+def _esri_geom_to_geojson(egeom: dict) -> dict | None:
+    if egeom is None:
+        return None
+    if "x" in egeom and "y" in egeom:
+        return {"type": "Point", "coordinates": [egeom["x"], egeom["y"]]}
+    if "rings" in egeom:
+        rings = egeom["rings"]
+        if not rings:
+            return None
+        # ArcGIS returns exterior rings CW; GeoJSON wants CCW exterior.
+        # shapely will accept either, so we don't bother rewinding here —
+        # the extractor pushes everything through shapely anyway. If a
+        # downstream consumer is strict, run shapely.geometry.polygon.orient.
+        if len(rings) == 1:
+            return {"type": "Polygon", "coordinates": [rings[0]]}
+        return {"type": "Polygon", "coordinates": rings}
+    if "paths" in egeom:
+        paths = egeom["paths"]
+        if len(paths) == 1:
+            return {"type": "LineString", "coordinates": paths[0]}
+        return {"type": "MultiLineString", "coordinates": paths}
+    return None
