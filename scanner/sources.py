@@ -42,6 +42,26 @@ class Layer:
     supports_pagination: bool
     max_record_count: int
 
+    def field_type(self, canonical: str) -> str | None:
+        """Esri field type (e.g. esriFieldTypeString) for a canonical name.
+
+        Returns None if the canonical name isn't in the field_map or the
+        actual column can't be found in the layer metadata."""
+        actual = self.field_map.get(canonical)
+        if actual is None:
+            return None
+        if actual.startswith("__COMPOSITE__:"):
+            return None
+        for f in self.metadata.get("fields") or []:
+            if f.get("name") == actual:
+                return f.get("type")
+        return None
+
+    def is_string_field(self, canonical: str) -> bool:
+        """True if the resolved field is Esri string-typed and needs quotes."""
+        t = self.field_type(canonical)
+        return t == "esriFieldTypeString"
+
 
 class ArcGISClient:
     def __init__(
@@ -78,6 +98,10 @@ class ArcGISClient:
                             f"non-JSON response from {url}: {e}"
                         ) from e
                     if isinstance(data, dict) and "error" in data:
+                        # ArcGIS often returns 200 with an error body — surface
+                        # the details we usually need (invalid where, bad
+                        # field name, etc.) plus the request that caused it.
+                        self._log_failed_request(url, params, data.get("error"))
                         raise ServiceError(
                             f"service error at {url}: {data['error']}"
                         )
@@ -86,6 +110,9 @@ class ArcGISClient:
                     raise requests.RequestException(
                         f"transient {r.status_code} from {url}"
                     )
+                # Terminal 4xx: dump the request so the user can see what
+                # was sent and diagnose without adding print statements.
+                self._log_failed_request(url, params, r.text[:500])
                 raise ServiceError(f"HTTP {r.status_code} from {url}")
             except (requests.RequestException, ServiceError) as e:
                 last_exc = e
@@ -98,6 +125,20 @@ class ArcGISClient:
                 time.sleep(delay)
                 delay = min(delay * 2, 30)
         raise ServiceError(f"giving up on {url}: {last_exc}")
+
+    @staticmethod
+    def _log_failed_request(url: str, params: dict | None, err) -> None:
+        p = dict(params or {})
+        log.error("REQUEST FAILED: %s", url)
+        for k in ("f", "where", "outFields", "outSR", "returnGeometry",
+                  "geometryType", "spatialRel", "resultOffset",
+                  "resultRecordCount"):
+            if k in p:
+                log.error("  %s = %s", k, p[k])
+        if "geometry" in p:
+            g = p["geometry"]
+            log.error("  geometry = %s...", str(g)[:120])
+        log.error("  response error = %s", err)
 
     # ---- Layer resolution ---------------------------------------------
 
@@ -170,6 +211,13 @@ class ArcGISClient:
 
         features: list[dict] = []
         offset = 0
+        # Log the outgoing query once (subsequent pages just increment offset).
+        log.info(
+            "QUERY %s/query where=%r outFields=%s returnGeometry=%s "
+            "geometryType=%s pageSize=%d",
+            layer.url, where, of_str, return_geometry,
+            base_params.get("geometryType", "n/a"), page_size,
+        )
         while True:
             params = dict(base_params)
             params["resultOffset"] = offset

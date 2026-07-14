@@ -69,6 +69,9 @@ ALIASES: dict[str, list[str]] = {
     ],
     "situs_zip": ["PHY_ZIPCD", "SITE_ZIP", "SITUS_ZIP", "ZIP"],
     "dor_uc": [
+        # FGIO / FGDL statewide layer uses the "01" suffix (up to 6 codes per parcel).
+        # DOR_UC (no suffix) is the legacy FGDL name; keep it as a fallback.
+        "DOR_UC01", "DORUC01", "LNDUSE_01", "LNDUSE01", "LNDUSE_1",
         "DOR_UC", "DORUC", "USE_CODE", "USECODE", "LAND_USE",
         "LANDUSE", "LAND_USE_CODE", "PROP_USE",
     ],

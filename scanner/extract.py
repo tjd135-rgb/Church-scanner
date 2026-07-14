@@ -42,6 +42,26 @@ class ExtractionResult:
     layer_used: str
 
 
+def _in_clause(layer: Layer, canonical: str, values: list) -> str:
+    """Build a syntactically clean `field IN (...)` clause.
+
+    Quotes the values if the layer's metadata reports the resolved field
+    as an Esri string type; otherwise emits bare numeric literals. Never
+    mixes quoted and unquoted values — that combination gets a 400 from
+    some ArcGIS backends.
+    """
+    field = layer.field_map.get(canonical)
+    if field is None:
+        raise RuntimeError(
+            f"cannot build IN() for canonical={canonical!r}: not mapped"
+        )
+    if layer.is_string_field(canonical):
+        parts = ",".join(f"'{str(v)}'" for v in values)
+    else:
+        parts = ",".join(str(int(v)) for v in values)
+    return f"{field} IN ({parts})"
+
+
 def _canonicalize(
     features: list[dict], fm: F.FieldMap
 ) -> gpd.GeoDataFrame:
@@ -127,10 +147,7 @@ def extract_by_land_use(
             f"layer {layer.url} exposes no DOR use-code field. Cannot filter "
             f"by land use. field_map.unresolved={fm.unresolved}"
         )
-    codes_sql = ",".join(f"'{c}'" for c in dor_codes) + "," + ",".join(
-        str(c) for c in dor_codes
-    )
-    where = f"{dor_field} IN ({codes_sql})"
+    where = _in_clause(layer, "dor_uc", dor_codes)
 
     # Union city polygons into a single Esri-JSON polygon envelope for the
     # geometry filter. We pass the full ring polygon (not just an envelope)
@@ -162,8 +179,7 @@ def extract_by_buffer(
     if dor_codes:
         dor_field = fm.get("dor_uc")
         if dor_field:
-            codes_sql = ",".join(str(c) for c in dor_codes)
-            where = f"{dor_field} IN ({codes_sql})"
+            where = _in_clause(layer, "dor_uc", dor_codes)
     log.info("pass B (buffer): querying %s where %s", layer.url, where)
     feats = client.query_all(
         layer, where=where, geometry=esri_geom,
@@ -196,8 +212,8 @@ def extract_by_address(
     like_clauses = " OR ".join(
         f"UPPER({situs_field}) LIKE '%{p}%'" for p in address_patterns
     )
-    codes_sql = ",".join(str(c) for c in dor_codes)
-    where = f"({like_clauses}) AND {dor_field} IN ({codes_sql})"
+    codes_clause = _in_clause(layer, "dor_uc", dor_codes)
+    where = f"({like_clauses}) AND {codes_clause}"
 
     esri_geom = _cities_to_esri_polygon(city_polygons_4326)
     log.info("pass C (address): querying %s where %s", layer.url, where)

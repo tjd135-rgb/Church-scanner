@@ -48,6 +48,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="Override buffer_ft from config.")
     p.add_argument("--skip-validation", action="store_true",
                    help="Do not fail loudly if known validation parcels miss.")
+    p.add_argument("--dump-metadata", action="store_true",
+                   help=(
+                       "Do not run the pipeline. Resolve the parcel layer, "
+                       "print every field and its Esri type, then exit. Use "
+                       "this to diagnose 400s from unexpected field names."
+                   ))
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
@@ -56,6 +62,9 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = cfg_mod.load(args.config)
     log.info("loaded config from %s", cfg.path)
+
+    if args.dump_metadata:
+        return _dump_metadata(cfg)
 
     result = pipe_mod.run(
         cfg,
@@ -72,6 +81,47 @@ def main(argv: list[str] | None = None) -> int:
             log.error("%d validation parcels missing — see log above",
                       len(missed))
             return 2
+    return 0
+
+
+def _dump_metadata(cfg) -> int:
+    """Resolve each configured parcel source and print its field list.
+
+    This does no querying — only the ?f=json metadata fetch — so it works
+    for diagnosing schema drift even when the query endpoint is misbehaving.
+    """
+    from scanner.sources import ArcGISClient, ServiceError
+
+    client = ArcGISClient(
+        cache_dir=cfg.cache_dir,
+        timeout_s=cfg.runtime.get("request_timeout_s", 60),
+        max_retries=cfg.runtime.get("max_retries", 4),
+        page_size=cfg.runtime.get("page_size", 2000),
+    )
+    for key in ("florida_statewide_parcels", "broward_bcpa", "palm_beach_papa"):
+        src = cfg.sources.get(key)
+        if not src:
+            continue
+        print(f"\n=== {key} ===")
+        try:
+            layer = client.resolve_layer(src.get("layers", []))
+        except ServiceError as e:
+            print(f"  unavailable: {e}")
+            continue
+        print(f"  url: {layer.url}")
+        print(f"  maxRecordCount: {layer.max_record_count}")
+        print(f"  supportsPagination: {layer.supports_pagination}")
+        print(f"  fields:")
+        for f in layer.metadata.get("fields", []) or []:
+            print(f"    {f.get('name'):<32} {f.get('type'):<24} "
+                  f"alias={f.get('alias')}")
+        print(f"  canonical field map:")
+        for c, actual in layer.field_map.mapping.items():
+            t = layer.field_type(c) or "n/a"
+            print(f"    {c:<20} -> {actual:<24} ({t})")
+        if layer.field_map.unresolved:
+            print(f"  unresolved canonical fields: "
+                  f"{layer.field_map.unresolved}")
     return 0
 
 
