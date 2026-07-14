@@ -149,16 +149,16 @@ def extract_by_land_use(
         )
     where = _in_clause(layer, "dor_uc", dor_codes)
 
-    # Union city polygons into a single Esri-JSON polygon envelope for the
-    # geometry filter. We pass the full ring polygon (not just an envelope)
-    # to avoid pulling in adjacent municipalities.
-    esri_geom = _cities_to_esri_polygon(city_polygons_4326)
+    # Union city polygons and hand them to the client. If the union is an
+    # axis-aligned rectangle (e.g. the corridor bbox fallback), the helper
+    # will emit an envelope instead of a polygon — safer, no winding.
+    esri_geom, geom_type = _cities_to_esri_geometry(city_polygons_4326)
 
     log.info("pass A (land use): querying %s where %s", layer.url, where)
     feats = client.query_all(
         layer,
         where=where,
-        geometry=esri_geom, geometry_type="esriGeometryPolygon",
+        geometry=esri_geom, geometry_type=geom_type,
     )
     log.info("pass A returned %d features", len(feats))
     gdf = _canonicalize(feats, fm)
@@ -174,7 +174,7 @@ def extract_by_buffer(
 ) -> gpd.GeoDataFrame:
     fm = layer.field_map
     corridor_4326 = corridor_buffer_3857.to_crs("EPSG:4326")
-    esri_geom = _shapely_to_esri_polygon(corridor_4326.geometry.iloc[0])
+    esri_geom, geom_type = shapely_to_esri_geometry(corridor_4326.geometry.iloc[0])
     where = "1=1"
     if dor_codes:
         dor_field = fm.get("dor_uc")
@@ -183,7 +183,7 @@ def extract_by_buffer(
     log.info("pass B (buffer): querying %s where %s", layer.url, where)
     feats = client.query_all(
         layer, where=where, geometry=esri_geom,
-        geometry_type="esriGeometryPolygon",
+        geometry_type=geom_type,
     )
     log.info("pass B returned %d features", len(feats))
     gdf = _canonicalize(feats, fm)
@@ -215,11 +215,11 @@ def extract_by_address(
     codes_clause = _in_clause(layer, "dor_uc", dor_codes)
     where = f"({like_clauses}) AND {codes_clause}"
 
-    esri_geom = _cities_to_esri_polygon(city_polygons_4326)
+    esri_geom, geom_type = _cities_to_esri_geometry(city_polygons_4326)
     log.info("pass C (address): querying %s where %s", layer.url, where)
     feats = client.query_all(
         layer, where=where, geometry=esri_geom,
-        geometry_type="esriGeometryPolygon",
+        geometry_type=geom_type,
     )
     log.info("pass C returned %d features", len(feats))
     gdf = _canonicalize(feats, fm)
@@ -280,17 +280,61 @@ def spatial_flag_in_buffer(
 
 
 # ---- Esri geometry helpers -------------------------------------------
+#
+# Esri REST API winding convention: exterior rings must be CLOCKWISE and
+# interior (hole) rings must be COUNTER-CLOCKWISE. A CCW exterior ring is
+# reinterpreted as a hole, which yields a malformed polygon and a 400
+# "Unable to perform query. Please check your parameters." Shapely's
+# default winding (from shapely.geometry.box, OSM data, shapefiles) is
+# CCW exterior — the opposite of what Esri wants — so we must orient
+# every polygon before emitting it. Also: when the input is a simple
+# axis-aligned rectangle (e.g. the corridor bbox fallback), emit an
+# esriGeometryEnvelope instead — envelopes have no winding at all.
+
+
+def _is_axis_aligned_rectangle(geom, tol: float = 1e-9) -> bool:
+    """True iff geom is a Polygon whose exterior is a 4-corner rectangle
+    aligned to the x/y axes and with no interior rings. tol handles the
+    tiny numeric jitter introduced by shapely operations."""
+    if geom.geom_type != "Polygon" or list(geom.interiors):
+        return False
+    coords = list(geom.exterior.coords)
+    if len(coords) not in (4, 5):
+        return False
+    minx, miny, maxx, maxy = geom.bounds
+    expected = {(minx, miny), (minx, maxy), (maxx, miny), (maxx, maxy)}
+    actual = set()
+    for x, y in coords[:-1] if len(coords) == 5 else coords:
+        actual.add((round(x, 12), round(y, 12)))
+    expected_r = {(round(x, 12), round(y, 12)) for x, y in expected}
+    return actual == expected_r
+
+
+def _shapely_to_esri_envelope(geom) -> dict:
+    minx, miny, maxx, maxy = geom.bounds
+    return {
+        "xmin": minx, "ymin": miny, "xmax": maxx, "ymax": maxy,
+        "spatialReference": {"wkid": 4326},
+    }
+
+
+def _orient_cw(polygon):
+    """Return the polygon with exterior CW and interior rings CCW."""
+    from shapely.geometry.polygon import orient
+    # sign=-1.0 -> exterior CW, interiors CCW (Esri convention).
+    return orient(polygon, sign=-1.0)
+
 
 def _shapely_to_esri_polygon(geom) -> dict:
-    """Convert a (Multi)Polygon in EPSG:4326 to an Esri JSON polygon."""
-    from shapely.geometry import Polygon, MultiPolygon
-    rings: list[list[list[float]]] = []
+    """Convert a (Multi)Polygon in EPSG:4326 to an Esri JSON polygon with
+    Esri-compliant ring winding (exterior CW, interior CCW)."""
     if geom.geom_type == "Polygon":
-        polys = [geom]
+        polys = [_orient_cw(geom)]
     elif geom.geom_type == "MultiPolygon":
-        polys = list(geom.geoms)
+        polys = [_orient_cw(p) for p in geom.geoms]
     else:
         raise ValueError(f"expected polygon geometry, got {geom.geom_type}")
+    rings: list[list[list[float]]] = []
     for p in polys:
         rings.append([[x, y] for x, y in p.exterior.coords])
         for interior in p.interiors:
@@ -298,9 +342,21 @@ def _shapely_to_esri_polygon(geom) -> dict:
     return {"rings": rings, "spatialReference": {"wkid": 4326}}
 
 
-def _cities_to_esri_polygon(city_polygons_4326: gpd.GeoDataFrame) -> dict:
+def shapely_to_esri_geometry(geom) -> tuple[dict, str]:
+    """Return (esri_geom_json, esriGeometryType) for a shapely geometry.
+
+    Prefers an envelope when the input is an axis-aligned rectangle since
+    envelopes carry no winding ambiguity."""
+    if _is_axis_aligned_rectangle(geom):
+        return _shapely_to_esri_envelope(geom), "esriGeometryEnvelope"
+    return _shapely_to_esri_polygon(geom), "esriGeometryPolygon"
+
+
+def _cities_to_esri_geometry(
+    city_polygons_4326: gpd.GeoDataFrame,
+) -> tuple[dict, str]:
     from shapely.ops import unary_union
     u = unary_union(city_polygons_4326.geometry.values)
     # Simplify slightly so the query payload stays under service limits.
     u = u.simplify(0.0005, preserve_topology=True)
-    return _shapely_to_esri_polygon(u)
+    return shapely_to_esri_geometry(u)

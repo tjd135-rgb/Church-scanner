@@ -193,7 +193,13 @@ class ArcGISClient:
         out_sr: int = 4326,
         return_geometry: bool = True,
     ) -> list[dict]:
-        """Page through all features matching `where`."""
+        """Page through all features matching `where`.
+
+        If a polygon geometry filter triggers a 400, we transparently
+        retry with the polygon's bounding envelope — a common workaround
+        for services that reject valid GeoJSON polygons under some
+        combination of spatial-index state, winding, or SR handling.
+        """
         page_size = min(self.page_size, layer.max_record_count or self.page_size)
         of_str = "*" if not out_fields else ",".join(sorted(set(out_fields)))
         base_params: dict[str, Any] = {
@@ -209,8 +215,6 @@ class ArcGISClient:
             base_params["spatialRel"] = "esriSpatialRelIntersects"
             base_params["inSR"] = 4326
 
-        features: list[dict] = []
-        offset = 0
         # Log the outgoing query once (subsequent pages just increment offset).
         log.info(
             "QUERY %s/query where=%r outFields=%s returnGeometry=%s "
@@ -218,6 +222,33 @@ class ArcGISClient:
             layer.url, where, of_str, return_geometry,
             base_params.get("geometryType", "n/a"), page_size,
         )
+        if geometry is not None:
+            log.debug("  geometry payload: %s", json.dumps(geometry)[:2000])
+
+        try:
+            return self._paged(layer, base_params, page_size)
+        except ServiceError as e:
+            if (
+                geometry is not None
+                and geometry_type == "esriGeometryPolygon"
+                and _is_geometry_error(str(e))
+            ):
+                env_geom = _polygon_to_envelope(geometry)
+                log.warning(
+                    "polygon geometry filter 400'd; retrying with bounding "
+                    "envelope %s", env_geom,
+                )
+                retry_params = dict(base_params)
+                retry_params["geometry"] = json.dumps(env_geom)
+                retry_params["geometryType"] = "esriGeometryEnvelope"
+                return self._paged(layer, retry_params, page_size)
+            raise
+
+    def _paged(
+        self, layer: Layer, base_params: dict, page_size: int,
+    ) -> list[dict]:
+        features: list[dict] = []
+        offset = 0
         while True:
             params = dict(base_params)
             params["resultOffset"] = offset
@@ -263,3 +294,40 @@ class ArcGISClient:
     def _cache_key(self, url: str, suffix: str) -> Path:
         h = hashlib.sha1(url.encode()).hexdigest()[:16]
         return self.cache_dir / f"{h}{suffix}"
+
+
+# --------------------------------------------------------------------
+# Module-level helpers for the polygon->envelope retry fallback.
+# --------------------------------------------------------------------
+
+_GEOMETRY_ERROR_MARKERS = (
+    "unable to perform query",
+    "invalid geometry",
+    "invalid spatial reference",
+    "geometry is malformed",
+    "check your parameters",
+    "http 400",
+)
+
+
+def _is_geometry_error(err_str: str) -> bool:
+    """Best-effort match for ArcGIS errors that suggest a geometry problem
+    rather than a WHERE-clause or field-name problem."""
+    s = err_str.lower()
+    return any(m in s for m in _GEOMETRY_ERROR_MARKERS)
+
+
+def _polygon_to_envelope(esri_geom: dict) -> dict:
+    """Reduce an Esri polygon (rings) to its bounding envelope."""
+    rings = esri_geom.get("rings") or []
+    if not rings:
+        raise ValueError("polygon geometry has no rings")
+    xs = [pt[0] for ring in rings for pt in ring]
+    ys = [pt[1] for ring in rings for pt in ring]
+    return {
+        "xmin": min(xs), "ymin": min(ys),
+        "xmax": max(xs), "ymax": max(ys),
+        "spatialReference": esri_geom.get(
+            "spatialReference", {"wkid": 4326}
+        ),
+    }
