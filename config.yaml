@@ -1,0 +1,123 @@
+# Parcel scanner configuration. Edit these knobs without touching code.
+
+# Spatial buffer (feet) around road centerlines. Task spec starts at 750 ft.
+buffer_ft: 750
+
+# Cities to bound the search. Names as they appear in county boundary layers.
+# County is used both as a hint and as a filter fallback if city polygon
+# lookup fails.
+cities:
+  - name: "Boca Raton"
+    county: "Palm Beach"
+    state: "FL"
+  - name: "Deerfield Beach"
+    county: "Broward"
+    state: "FL"
+  - name: "Pompano Beach"
+    county: "Broward"
+    state: "FL"
+
+# Road corridors to buffer, expressed as OSM way name patterns. osmnx uses a
+# case-insensitive regex on the "name" and "ref" tags.
+roads:
+  - label: "US-1 / Federal Highway"
+    osm_ref_patterns: ["^US 1$", "^US-1$"]
+    osm_name_patterns: ["Federal Hwy", "Federal Highway", "S Federal Hwy", "N Federal Hwy"]
+  - label: "Dixie Highway / SR 811"
+    osm_ref_patterns: ["^SR 811$", "^FL 811$"]
+    osm_name_patterns: ["Dixie Hwy", "Dixie Highway", "S Dixie Hwy", "N Dixie Hwy", "Old Dixie Hwy", "Old Dixie Highway", "NE Dixie Hwy"]
+
+# Situs-address fallback patterns (case-insensitive substring). A parcel whose
+# situs address matches any of these — but that the spatial buffer missed —
+# is included with a flag.
+address_patterns:
+  - "FEDERAL HWY"
+  - "FEDERAL HIGHWAY"
+  - "US HIGHWAY 1"
+  - "US HWY 1"
+  - "US-1"
+  - "DIXIE HWY"
+  - "DIXIE HIGHWAY"
+  - "SR 811"
+  - "SR-811"
+
+# Florida DOR land use codes to include.
+# 71 = Churches, 72 = Private Schools and Colleges.
+dor_use_codes: [71, 72]
+
+# Composite score weights. Must sum to 1.0. Documented in output.
+# Rationale:
+#   - acreage: bigger sites drive bigger redevelopment potential (0.30)
+#   - land utilization ratio (inverse): lower building coverage = more upside (0.30)
+#   - land value share: value in dirt vs. structure signals redevelopability (0.25)
+#   - hold period: long holds correlate with legacy, low-leverage owners (0.15)
+score_weights:
+  acreage: 0.30
+  lur_inverse: 0.30
+  land_value_share: 0.25
+  hold_period: 0.15
+
+# Reference caps for score normalization (0-100 scale).
+# Values at or above these thresholds saturate at 100.
+score_caps:
+  acreage_ac_max: 10.0        # 10+ acres = 100
+  lur_zero_target: 0.05       # LUR of 0.05 or lower -> 100 (very under-built)
+  land_value_share_max: 0.9   # 90%+ of value in land -> 100
+  hold_period_years_max: 40   # 40+ years since last sale -> 100
+
+# Known validation parcels. Pipeline errors loudly if any are missing after
+# a full run (unless --skip-validation is passed).
+validation_parcels:
+  - name: "St. Ambrose Catholic Church"
+    address_contains: "380 S FEDERAL"
+    city: "Deerfield Beach"
+    parcel_id: "484306000200"        # 48-43-06-00-0200 (Broward folio, digits only)
+    approx_acres: 11.92
+  - name: "Deerfield Christian Academy"
+    address_contains: "747 S FEDERAL"
+    city: "Deerfield Beach"
+    approx_acres: 1.93
+  - name: "Cathedral Church of God"
+    address_contains: "365 S DIXIE"
+    city: "Deerfield Beach"
+    parcel_id: "484306120030"        # 48-43-06-12-0030
+    approx_acres: 1.25
+  - name: "Florida Coast Church"
+    address_contains: "371 S FEDERAL"
+    city: "Pompano Beach"
+
+# ArcGIS REST endpoints. Overridable so an operator can swap in a mirror or
+# a newer service URL without editing code. Each entry has a `layers` list;
+# each layer is tried in order until one responds with a valid metadata JSON.
+sources:
+  florida_statewide_parcels:
+    # FGIO / FDOR statewide parcels — primary source per spec. The current
+    # public feature service URL is subject to change; the loader queries
+    # /?f=json and rewrites field names via the alias map below, so a
+    # replacement URL rarely needs any other code change.
+    layers:
+      - "https://services9.arcgis.com/Gh9awoU677aKree0/arcgis/rest/services/Florida_Statewide_Cadastral/FeatureServer/0"
+      - "https://services1.arcgis.com/KTcxiTD9dsQw4r7Z/ArcGIS/rest/services/Florida_Statewide_Parcels/FeatureServer/0"
+  broward_bcpa:
+    layers:
+      - "https://services1.arcgis.com/BrowardGIS/arcgis/rest/services/BCPA_Parcels/FeatureServer/0"
+      - "https://gis.broward.org/arcgis/rest/services/BCPA/Parcels/MapServer/0"
+  palm_beach_papa:
+    layers:
+      - "https://services1.arcgis.com/salGX9x60g7O2hSt/arcgis/rest/services/Parcels/FeatureServer/0"
+      - "https://maps.pbcgov.org/arcgis/rest/services/PropertyAppraiser/Parcels/MapServer/0"
+  city_boundaries:
+    # Municipal boundary layers (used to clip parcels to the three cities).
+    layers:
+      - "https://services1.arcgis.com/KTcxiTD9dsQw4r7Z/arcgis/rest/services/Florida_Municipal_Boundaries/FeatureServer/0"
+      - "https://services3.arcgis.com/ZGrptGlLV2IILABw/ArcGIS/rest/services/Cities/FeatureServer/0"
+
+# Runtime knobs.
+runtime:
+  request_timeout_s: 60
+  max_retries: 4
+  page_size: 2000
+  cache_dir: "./data/cache"
+  # If OSM/Overpass is unreachable and no cached centerlines exist, the
+  # pipeline aborts rather than silently running with an empty corridor.
+  require_road_centerlines: true
