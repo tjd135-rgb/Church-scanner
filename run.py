@@ -174,72 +174,77 @@ def _probe_query(cfg) -> int:
     if dor_field is None:
         print("  no DOR use-code field mapped — cannot build WHERE. abort.")
         return 1
-    where = (
-        f"{dor_field} IN ('71','72')"
-        if layer.is_string_field("dor_uc")
-        else f"{dor_field} IN (71,72)"
-    )
-    pid_field = layer.field_map.get("parcel_id") or "OBJECTID"
+    # Look up the actual Esri type of the resolved DOR field from metadata
+    # so we can print it — the earlier probe fell over identically on all
+    # 8 rows because they all shared one WHERE. This time we test the
+    # WHERE clause in isolation across quoted / unquoted variants BEFORE
+    # anything else, so a type mismatch is unambiguously visible.
+    dor_type = layer.field_type("dor_uc")
+    oid_field = layer.metadata.get("objectIdField") or "OBJECTID"
+    print(f"  dor_uc field          = {dor_field} (type={dor_type})")
+    print(f"  objectIdField         = {oid_field}")
+
+    where_quoted = f"{dor_field} IN ('71','72')"
+    where_unquoted = f"{dor_field} IN (71,72)"
+    where_eq_q = f"{dor_field} = '71'"
+    where_eq_u = f"{dor_field} = 71"
+
+    envelope = json.dumps({
+        "xmin": -80.20, "ymin": 26.20, "xmax": -80.05, "ymax": 26.42,
+        "spatialReference": {"wkid": 4326},
+    })
+
+    def _p(**extra):
+        base = {"f": "json", "outFields": oid_field,
+                "resultRecordCount": 1, "returnGeometry": "false"}
+        base.update(extra)
+        return base
 
     probes: list[tuple[str, dict]] = [
-        # (label, params) — each row adds one thing to the previous.
-        ("baseline: f=json, where only, OBJECTID, count=1, no geom",
-         {"f": "json", "where": where,
-          "outFields": "OBJECTID", "resultRecordCount": 1,
-          "returnGeometry": "false"}),
-        ("+ outFields=*",
-         {"f": "json", "where": where,
-          "outFields": "*", "resultRecordCount": 1,
-          "returnGeometry": "false"}),
-        ("+ outFields=OBJECTID," + str(pid_field),
-         {"f": "json", "where": where,
-          "outFields": f"OBJECTID,{pid_field}",
-          "resultRecordCount": 1, "returnGeometry": "false"}),
-        ("+ resultRecordCount=100",
-         {"f": "json", "where": where,
-          "outFields": "OBJECTID", "resultRecordCount": 100,
-          "returnGeometry": "false"}),
-        ("+ returnGeometry=true (f=json)",
-         {"f": "json", "where": where,
-          "outFields": "OBJECTID", "resultRecordCount": 1,
-          "returnGeometry": "true", "outSR": 4326}),
-        ("+ f=geojson (no geometry filter, returnGeometry=true)",
-         {"f": "geojson", "where": where,
-          "outFields": "OBJECTID", "resultRecordCount": 1,
-          "returnGeometry": "true", "outSR": 4326}),
-        ("+ envelope filter (f=json, envelope covering tri-city area)",
-         {"f": "json", "where": where,
-          "outFields": "OBJECTID", "resultRecordCount": 1,
-          "returnGeometry": "false",
-          "geometry": json.dumps({
-              "xmin": -80.20, "ymin": 26.20,
-              "xmax": -80.05, "ymax": 26.42,
-              "spatialReference": {"wkid": 4326},
-          }),
-          "geometryType": "esriGeometryEnvelope",
-          "spatialRel": "esriSpatialRelIntersects",
-          "inSR": 4326}),
-        ("+ envelope filter with f=geojson",
-         {"f": "geojson", "where": where,
-          "outFields": "OBJECTID", "resultRecordCount": 1,
-          "returnGeometry": "true", "outSR": 4326,
-          "geometry": json.dumps({
-              "xmin": -80.20, "ymin": 26.20,
-              "xmax": -80.05, "ymax": 26.42,
-              "spatialReference": {"wkid": 4326},
-          }),
-          "geometryType": "esriGeometryEnvelope",
-          "spatialRel": "esriSpatialRelIntersects",
-          "inSR": 4326}),
+        # ---- Level 0: no WHERE at all -------------------------------
+        ("L0a: returnCountOnly, where=1=1",
+         {"f": "json", "where": "1=1", "returnCountOnly": "true"}),
+        ("L0b: where=1=1, count=1, OBJECTID",
+         _p(where="1=1")),
+        # ---- Level 1: is the WHERE clause the problem? --------------
+        (f"L1a: where={where_quoted!r}",
+         _p(where=where_quoted)),
+        (f"L1b: where={where_unquoted!r} (unquoted)",
+         _p(where=where_unquoted)),
+        (f"L1c: where={where_eq_q!r}",
+         _p(where=where_eq_q)),
+        (f"L1d: where={where_eq_u!r}",
+         _p(where=where_eq_u)),
+        # ---- Level 2: parameters that services sometimes require ----
+        ("L2a: L0b + orderByFields=OBJECTID",
+         _p(where="1=1", orderByFields="OBJECTID")),
+        ("L2b: L0b + resultType=standard",
+         _p(where="1=1", resultType="standard")),
+        # ---- Level 3: escalate to the full pipeline query -----------
+        ("L3a: L1a-or-b (whichever wins) + outFields=*",
+         _p(where=where_unquoted, outFields="*")),
+        ("L3b: + resultRecordCount=100",
+         _p(where=where_unquoted, resultRecordCount=100)),
+        ("L3c: + returnGeometry=true, outSR=4326",
+         _p(where=where_unquoted,
+            returnGeometry="true", outSR=4326)),
+        ("L3d: + envelope filter (f=json)",
+         _p(where=where_unquoted, geometry=envelope,
+            geometryType="esriGeometryEnvelope",
+            spatialRel="esriSpatialRelIntersects", inSR=4326)),
+        ("L3e: + envelope filter (f=geojson)",
+         _p(f="geojson", where=where_unquoted, returnGeometry="true",
+            outSR=4326, geometry=envelope,
+            geometryType="esriGeometryEnvelope",
+            spatialRel="esriSpatialRelIntersects", inSR=4326)),
     ]
 
     endpoint = f"{layer.url}/query"
     session = requests.Session()
     session.headers.update({"User-Agent": "church-scanner-probe/1.0"})
-    print(f"\nendpoint = {endpoint}")
-    print(f"WHERE    = {where}\n")
-    print(f"{'#':>2}  {'status':>6}  {'nfeat':>5}  label")
-    print(f"{'-'*2}  {'-'*6}  {'-'*5}  {'-'*60}")
+    print(f"\nendpoint = {endpoint}\n")
+    print(f"{'#':>2}  {'status':>8}  {'nfeat':>7}  label")
+    print(f"{'-'*2}  {'-'*8}  {'-'*7}  {'-'*60}")
 
     for i, (label, params) in enumerate(probes, 1):
         try:
@@ -255,10 +260,13 @@ def _probe_query(cfg) -> int:
                 err = body["error"]
                 note = (
                     f"error code={err.get('code')} "
-                    f"details={err.get('details')}"
+                    f"details={err.get('details')} "
+                    f"message={err.get('message')!r}"
                 )
                 nfeat = "-"
                 status = f"{status} err"
+            elif isinstance(body, dict) and "count" in body:
+                nfeat = f"cnt={body['count']}"
             elif isinstance(body, dict):
                 nfeat = len(body.get("features") or [])
             else:
@@ -267,9 +275,9 @@ def _probe_query(cfg) -> int:
             status = "EXC"
             nfeat = "-"
             note = str(e)
-        print(f"{i:>2}  {str(status):>6}  {str(nfeat):>5}  {label}")
+        print(f"{i:>2}  {str(status):>8}  {str(nfeat):>7}  {label}")
         if note:
-            print(f"      -> {note}")
+            print(f"       -> {note}")
     return 0
 
 
