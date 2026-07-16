@@ -45,17 +45,23 @@ class ExtractionResult:
 def _in_clause(layer: Layer, canonical: str, values: list) -> str:
     """Build a syntactically clean `field IN (...)` clause.
 
-    Quotes the values if the layer's metadata reports the resolved field
-    as an Esri string type; otherwise emits bare numeric literals. Never
-    mixes quoted and unquoted values — that combination gets a 400 from
-    some ArcGIS backends.
+    Quotes values based on Esri field type from cached metadata; never
+    mixes quoted and unquoted (some ArcGIS backends 400 on that).
+
+    Special case for `dor_uc`: FGIO Statewide Cadastral reports DOR_UC
+    as esriFieldTypeString but rejects quoted-literal comparisons with
+    'Cannot perform query. Invalid query parameters.' — verified by the
+    --probe-query L1a/L1b test. DOR use codes are always integers 0-99,
+    so we compare unquoted regardless of the metadata's reported type.
     """
     field = layer.field_map.get(canonical)
     if field is None:
         raise RuntimeError(
             f"cannot build IN() for canonical={canonical!r}: not mapped"
         )
-    if layer.is_string_field(canonical):
+    if canonical == "dor_uc":
+        parts = ",".join(str(int(v)) for v in values)
+    elif layer.is_string_field(canonical):
         parts = ",".join(f"'{str(v)}'" for v in values)
     else:
         parts = ",".join(str(int(v)) for v in values)
@@ -165,12 +171,17 @@ def extract_by_land_use(
         )
     where = _in_clause(layer, "dor_uc", dor_codes)
 
-    # Union city polygons and hand them to the client. If the union is an
-    # axis-aligned rectangle (e.g. the corridor bbox fallback), the helper
-    # will emit an envelope instead of a polygon — safer, no winding.
-    esri_geom, geom_type = _cities_to_esri_geometry(city_polygons_4326)
+    # Union city polygons and hand them to the client, pre-projected to
+    # the layer's native SR. If the union is an axis-aligned rectangle
+    # (e.g. the corridor bbox fallback), the helper emits an envelope
+    # instead of a polygon.
+    target_wkid = native_wkid(layer)
+    esri_geom, geom_type = _cities_to_esri_geometry(
+        city_polygons_4326, target_wkid=target_wkid,
+    )
 
-    log.info("pass A (land use): querying %s where %s", layer.url, where)
+    log.info("pass A (land use): querying %s where %s (inSR=%d)",
+             layer.url, where, target_wkid)
     feats = client.query_all(
         layer,
         where=where,
@@ -190,7 +201,10 @@ def extract_by_buffer(
 ) -> gpd.GeoDataFrame:
     fm = layer.field_map
     corridor_4326 = corridor_buffer_3857.to_crs("EPSG:4326")
-    esri_geom, geom_type = shapely_to_esri_geometry(corridor_4326.geometry.iloc[0])
+    target_wkid = native_wkid(layer)
+    esri_geom, geom_type = shapely_to_esri_geometry(
+        corridor_4326.geometry.iloc[0], target_wkid=target_wkid,
+    )
     where = "1=1"
     if dor_codes:
         dor_field = fm.get("dor_uc")
@@ -231,8 +245,12 @@ def extract_by_address(
     codes_clause = _in_clause(layer, "dor_uc", dor_codes)
     where = f"({like_clauses}) AND {codes_clause}"
 
-    esri_geom, geom_type = _cities_to_esri_geometry(city_polygons_4326)
-    log.info("pass C (address): querying %s where %s", layer.url, where)
+    target_wkid = native_wkid(layer)
+    esri_geom, geom_type = _cities_to_esri_geometry(
+        city_polygons_4326, target_wkid=target_wkid,
+    )
+    log.info("pass C (address): querying %s where %s (inSR=%d)",
+             layer.url, where, target_wkid)
     feats = client.query_all(
         layer, where=where, geometry=esri_geom,
         geometry_type=geom_type,
@@ -327,11 +345,35 @@ def _is_axis_aligned_rectangle(geom, tol: float = 1e-9) -> bool:
     return actual == expected_r
 
 
-def _shapely_to_esri_envelope(geom) -> dict:
+def native_wkid(layer: Layer) -> int:
+    """Return the layer's native spatial-reference WKID (from extent).
+
+    Some enterprise ArcGIS services can't reproject an input geometry
+    from a client SR (like 4326) into the layer's native SR on the fly
+    — they return 'Cannot perform query. Invalid query parameters.' for
+    any spatial filter. Sending the geometry pre-projected to the
+    layer's own SR avoids the round-trip. Verified in --probe-query
+    L3d against Florida_Statewide_Cadastral (native SR 3086)."""
+    ext = layer.metadata.get("extent") or {}
+    sr = ext.get("spatialReference") or {}
+    return int(sr.get("latestWkid") or sr.get("wkid") or 4326)
+
+
+def _project_geom(geom, source_wkid: int, target_wkid: int):
+    """Reproject a shapely geometry between two WKIDs (skips no-op)."""
+    if source_wkid == target_wkid:
+        return geom
+    from pyproj import Transformer
+    from shapely.ops import transform
+    tf = Transformer.from_crs(source_wkid, target_wkid, always_xy=True)
+    return transform(tf.transform, geom)
+
+
+def _shapely_to_esri_envelope(geom, wkid: int = 4326) -> dict:
     minx, miny, maxx, maxy = geom.bounds
     return {
         "xmin": minx, "ymin": miny, "xmax": maxx, "ymax": maxy,
-        "spatialReference": {"wkid": 4326},
+        "spatialReference": {"wkid": wkid},
     }
 
 
@@ -342,9 +384,10 @@ def _orient_cw(polygon):
     return orient(polygon, sign=-1.0)
 
 
-def _shapely_to_esri_polygon(geom) -> dict:
-    """Convert a (Multi)Polygon in EPSG:4326 to an Esri JSON polygon with
-    Esri-compliant ring winding (exterior CW, interior CCW)."""
+def _shapely_to_esri_polygon(geom, wkid: int = 4326) -> dict:
+    """Convert a (Multi)Polygon to an Esri JSON polygon with Esri-compliant
+    ring winding (exterior CW, interior CCW). Caller is responsible for
+    supplying the geometry already in the target SR."""
     if geom.geom_type == "Polygon":
         polys = [_orient_cw(geom)]
     elif geom.geom_type == "MultiPolygon":
@@ -356,24 +399,45 @@ def _shapely_to_esri_polygon(geom) -> dict:
         rings.append([[x, y] for x, y in p.exterior.coords])
         for interior in p.interiors:
             rings.append([[x, y] for x, y in interior.coords])
-    return {"rings": rings, "spatialReference": {"wkid": 4326}}
+    return {"rings": rings, "spatialReference": {"wkid": wkid}}
 
 
-def shapely_to_esri_geometry(geom) -> tuple[dict, str]:
+def shapely_to_esri_geometry(
+    geom_4326, target_wkid: int = 4326,
+) -> tuple[dict, str]:
     """Return (esri_geom_json, esriGeometryType) for a shapely geometry.
 
-    Prefers an envelope when the input is an axis-aligned rectangle since
-    envelopes carry no winding ambiguity."""
-    if _is_axis_aligned_rectangle(geom):
-        return _shapely_to_esri_envelope(geom), "esriGeometryEnvelope"
-    return _shapely_to_esri_polygon(geom), "esriGeometryPolygon"
+    The input is expected in EPSG:4326. If `target_wkid` differs, the
+    geometry is reprojected client-side before serialization — that
+    avoids relying on the ArcGIS server to reproject the filter, which
+    some large enterprise services can't or won't do.
+
+    Envelope preference is decided on the INPUT geometry (before
+    projection): if the caller handed us an axis-aligned rectangle in
+    4326, we emit the projected geometry's bounding box as an envelope
+    even though projection may have introduced tiny corner distortion.
+    That's a superset filter — downstream client-side filtering
+    catches any extra parcels near the corners — and gives us the
+    envelope-simplicity payoff without a winding gotcha."""
+    was_bbox = _is_axis_aligned_rectangle(geom_4326)
+    projected = _project_geom(geom_4326, 4326, target_wkid)
+    if was_bbox:
+        return (
+            _shapely_to_esri_envelope(projected, wkid=target_wkid),
+            "esriGeometryEnvelope",
+        )
+    return (
+        _shapely_to_esri_polygon(projected, wkid=target_wkid),
+        "esriGeometryPolygon",
+    )
 
 
 def _cities_to_esri_geometry(
-    city_polygons_4326: gpd.GeoDataFrame,
+    city_polygons_4326: gpd.GeoDataFrame, target_wkid: int = 4326,
 ) -> tuple[dict, str]:
     from shapely.ops import unary_union
     u = unary_union(city_polygons_4326.geometry.values)
-    # Simplify slightly so the query payload stays under service limits.
+    # Simplify slightly (in 4326 degrees) so the query payload stays under
+    # service limits; the projection below is unaffected by the simplify.
     u = u.simplify(0.0005, preserve_topology=True)
-    return shapely_to_esri_geometry(u)
+    return shapely_to_esri_geometry(u, target_wkid=target_wkid)

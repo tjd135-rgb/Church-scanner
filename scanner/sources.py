@@ -252,7 +252,14 @@ class ArcGISClient:
             base_params["geometry"] = json.dumps(geometry)
             base_params["geometryType"] = geometry_type
             base_params["spatialRel"] = "esriSpatialRelIntersects"
-            base_params["inSR"] = 4326
+            # Read inSR from the geometry object so the caller's choice
+            # of SR is honored end-to-end. Falls back to 4326 if absent.
+            g_sr = (geometry.get("spatialReference") or {}) if isinstance(
+                geometry, dict
+            ) else {}
+            base_params["inSR"] = int(
+                g_sr.get("wkid") or g_sr.get("latestWkid") or 4326
+            )
 
         # Log the outgoing query once (subsequent pages just increment offset).
         log.info(
