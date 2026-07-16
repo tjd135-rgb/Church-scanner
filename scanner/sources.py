@@ -235,14 +235,15 @@ class ArcGISClient:
         """
         page_size = min(self.page_size, layer.max_record_count or self.page_size)
         of_str = "*" if not out_fields else ",".join(sorted(set(out_fields)))
-        # Only ask for f=geojson if the layer explicitly advertises it in
-        # supportedQueryFormats. Large FeatureServer instances (like the
-        # FGIO statewide layer) support only JSON+AMF and return a generic
-        # 400 for f=geojson — the exact symptom we're chasing. Esri JSON
-        # is universal; we convert the geometry ourselves in _paged().
-        wants_geojson = return_geometry and layer.supports_geojson_output
+        # Always use Esri JSON (f=json). GeoJSON output is up to ~5x heavier
+        # to serialize per feature; on a wide+tall payload (many rows,
+        # many fields, with geometry) FGIO Statewide Cadastral rejects it
+        # with 'Unable to perform query' even though its metadata
+        # advertises geoJSON in supportedQueryFormats. Esri JSON works
+        # everywhere and we convert to GeoJSON-shaped features client-side
+        # in _esri_features_to_geojson.
         base_params: dict[str, Any] = {
-            "f": "geojson" if wants_geojson else "json",
+            "f": "json",
             "where": where,
             "outFields": of_str,
             "outSR": out_sr,

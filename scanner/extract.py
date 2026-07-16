@@ -173,7 +173,14 @@ def query_target_parcels(
 
     Returns geometry in EPSG:4326 (client asks for outSR=4326). County
     bounding keeps the payload manageable — statewide DOR 71/72 would
-    be ~30-50k rows; two counties trim that to a few thousand."""
+    be ~30-50k rows; two counties trim that to a few thousand.
+
+    Requests only the ~20 fields our field_map actually reads (plus
+    OBJECTID for stable pagination) rather than outFields=*. FGIO's
+    Statewide Cadastral has ~118 columns; asking for all of them
+    combined with returnGeometry=true pushes the query past whatever
+    internal cost limit produces 'Unable to perform query.'
+    """
     fm = layer.field_map
     dor_field = fm.get("dor_uc")
     if dor_field is None:
@@ -187,11 +194,32 @@ def query_target_parcels(
         # emits unquoted numeric literals for non-string fields.
         where += " AND " + _in_clause(layer, "county", county_numbers)
 
-    log.info("querying %s where %s", layer.url, where)
-    feats = client.query_all(layer, where=where)
+    out_fields = _fields_needed_for_extraction(layer)
+    log.info(
+        "querying %s where %s (outFields=%d cols)",
+        layer.url, where, len(out_fields),
+    )
+    feats = client.query_all(layer, where=where, out_fields=out_fields)
     log.info("server returned %d features", len(feats))
     gdf = _canonicalize(feats, fm)
     return gdf
+
+
+def _fields_needed_for_extraction(layer: Layer) -> list[str]:
+    """Return the actual layer field names we need to read (canonical
+    field_map values + OBJECTID for stable pagination). Expands the
+    special __COMPOSITE__ marker into its component fields."""
+    fm = layer.field_map
+    needed: set[str] = set()
+    oid = layer.metadata.get("objectIdField") or "OBJECTID"
+    needed.add(oid)
+    for actual in fm.mapping.values():
+        if actual.startswith("__COMPOSITE__:"):
+            parts = actual.split(":", 1)[1].split(",")
+            needed.update(p.strip() for p in parts if p.strip())
+        else:
+            needed.add(actual)
+    return sorted(needed)
 
 
 def apply_pass_flags(

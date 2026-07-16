@@ -132,7 +132,11 @@ sources:
 runtime:
   request_timeout_s: 60
   max_retries: 4
-  page_size: 2000
+  # Server-advertised max is often 2000, but combined with returnGeometry
+  # and a multi-column outFields list some services (FGIO Statewide
+  # Cadastral) reject at that page size with 'Unable to perform query.'
+  # 1000 empirically works.
+  page_size: 1000
   cache_dir: "./data/cache"
   # If OSM/Overpass is unreachable and no cached centerlines exist, the
   # pipeline aborts rather than silently running with an empty corridor.
