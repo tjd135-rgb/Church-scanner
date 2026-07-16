@@ -249,6 +249,13 @@ class ArcGISClient:
             "outSR": out_sr,
             "returnGeometry": "true" if return_geometry else "false",
         }
+        # resultOffset needs a stable ordering. Some services (FGIO
+        # Statewide Cadastral among them) reject any paged query without
+        # an explicit orderByFields with 'Cannot perform query. Invalid
+        # query parameters.' — the same generic 400 that hid this for
+        # several rounds. Set it to the layer's declared objectIdField.
+        oid = layer.metadata.get("objectIdField") or "OBJECTID"
+        base_params["orderByFields"] = oid
         if geometry is not None:
             base_params["geometry"] = json.dumps(geometry)
             base_params["geometryType"] = geometry_type
