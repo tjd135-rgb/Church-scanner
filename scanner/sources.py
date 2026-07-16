@@ -30,6 +30,17 @@ log = logging.getLogger(__name__)
 
 
 class ServiceError(RuntimeError):
+    """Base for all service-side errors."""
+    pass
+
+
+class TerminalServiceError(ServiceError):
+    """A 4xx or explicit ArcGIS error body that will not succeed on retry.
+
+    Distinguishing terminal errors from transient ones (5xx, 429, network
+    timeouts) matters because retrying a hard 400 four times just wastes
+    the user's minutes and clogs the log. Terminal errors bubble up
+    immediately; transient ones use exponential backoff."""
     pass
 
 
@@ -111,11 +122,11 @@ class ArcGISClient:
                             f"non-JSON response from {url}: {e}"
                         ) from e
                     if isinstance(data, dict) and "error" in data:
-                        # ArcGIS often returns 200 with an error body — surface
-                        # the details we usually need (invalid where, bad
-                        # field name, etc.) plus the request that caused it.
+                        # ArcGIS often returns 200 with an error body. These
+                        # are terminal — no amount of retrying will change
+                        # 'field not found' or 'invalid URL'.
                         self._log_failed_request(url, params, data.get("error"))
-                        raise ServiceError(
+                        raise TerminalServiceError(
                             f"service error at {url}: {data['error']}"
                         )
                     return data
@@ -123,10 +134,12 @@ class ArcGISClient:
                     raise requests.RequestException(
                         f"transient {r.status_code} from {url}"
                     )
-                # Terminal 4xx: dump the request so the user can see what
-                # was sent and diagnose without adding print statements.
+                # Terminal 4xx: dump the request and stop retrying.
                 self._log_failed_request(url, params, r.text[:500])
-                raise ServiceError(f"HTTP {r.status_code} from {url}")
+                raise TerminalServiceError(f"HTTP {r.status_code} from {url}")
+            except TerminalServiceError:
+                # No retry — the response is what it is.
+                raise
             except (requests.RequestException, ServiceError) as e:
                 last_exc = e
                 if attempt >= self.max_retries:
@@ -157,8 +170,11 @@ class ArcGISClient:
 
     def resolve_layer(self, candidate_urls: Iterable[str]) -> Layer:
         """Try each candidate URL in order; return the first that responds."""
+        candidates = list(candidate_urls or [])
+        if not candidates:
+            raise ServiceError("no candidate URLs configured for this source")
         errors: list[str] = []
-        for url in candidate_urls:
+        for url in candidates:
             try:
                 meta = self._get_layer_metadata(url)
                 fm = F.resolve_from_metadata(url, meta)

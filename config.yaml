@@ -99,13 +99,22 @@ sources:
       - "https://services9.arcgis.com/Gh9awoU677aKree0/arcgis/rest/services/Florida_Statewide_Cadastral/FeatureServer/0"
       - "https://services1.arcgis.com/KTcxiTD9dsQw4r7Z/ArcGIS/rest/services/Florida_Statewide_Parcels/FeatureServer/0"
   broward_bcpa:
-    layers:
-      - "https://services1.arcgis.com/BrowardGIS/arcgis/rest/services/BCPA_Parcels/FeatureServer/0"
-      - "https://gis.broward.org/arcgis/rest/services/BCPA/Parcels/MapServer/0"
+    # DISABLED: the two URLs below are unverified placeholders. The first
+    # ("BrowardGIS" org slug) returns ArcGIS "Invalid URL" — ArcGIS Online
+    # org slugs are alphanumeric hashes, not human-readable names — and
+    # the second (gis.broward.org) times out. Replace with the real BCPA
+    # FeatureServer URL from https://gisportal.co.broward.fl.us or the
+    # BCPA hub, then uncomment. Until then, statewide FGIO covers Broward.
+    layers: []
+    # layers:
+    #   - "https://services1.arcgis.com/BrowardGIS/arcgis/rest/services/BCPA_Parcels/FeatureServer/0"
+    #   - "https://gis.broward.org/arcgis/rest/services/BCPA/Parcels/MapServer/0"
   palm_beach_papa:
-    layers:
-      - "https://services1.arcgis.com/salGX9x60g7O2hSt/arcgis/rest/services/Parcels/FeatureServer/0"
-      - "https://maps.pbcgov.org/arcgis/rest/services/PropertyAppraiser/Parcels/MapServer/0"
+    # DISABLED for the same reason — URLs unverified. Statewide FGIO covers PBC.
+    layers: []
+    # layers:
+    #   - "https://services1.arcgis.com/salGX9x60g7O2hSt/arcgis/rest/services/Parcels/FeatureServer/0"
+    #   - "https://maps.pbcgov.org/arcgis/rest/services/PropertyAppraiser/Parcels/MapServer/0"
   city_boundaries:
     # Municipal boundary layers (used to clip parcels to the three cities).
     layers:
