@@ -93,6 +93,22 @@ def _canonicalize(
     return gdf
 
 
+def _fill_derived_bldg_val(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Compute bldg_val = total_val - land_val where the layer doesn't
+    expose an improvement value directly. FGDL statewide is the driver:
+    it carries JV (total) and LND_VAL but no IMP_VAL."""
+    if "bldg_val" not in gdf.columns:
+        gdf["bldg_val"] = pd.NA
+    gdf["bldg_val"] = pd.to_numeric(gdf["bldg_val"], errors="coerce")
+    tv = pd.to_numeric(gdf.get("total_val"), errors="coerce")
+    lv = pd.to_numeric(gdf.get("land_val"), errors="coerce")
+    mask = gdf["bldg_val"].isna() & tv.notna() & lv.notna()
+    if mask.any():
+        derived = (tv - lv).clip(lower=0)
+        gdf.loc[mask, "bldg_val"] = derived[mask]
+    return gdf
+
+
 def _fill_lot_metrics(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """Fill lot_ac from lot_sf (or geometry) and vice-versa where missing."""
     if "lot_sf" in gdf.columns:
@@ -262,6 +278,7 @@ def merge_passes(*gdfs: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
                                 crs=merged.crs)
     combined = _numeric_columns(combined)
     combined = _fill_lot_metrics(combined)
+    combined = _fill_derived_bldg_val(combined)
     return combined
 
 

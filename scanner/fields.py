@@ -80,6 +80,9 @@ ALIASES: dict[str, list[str]] = {
         "LND_VAL", "LAND_VAL", "LAND_VALUE", "LANDVAL", "JV_LAND",
     ],
     "bldg_val": [
+        # FGDL statewide layer does NOT expose an improvement value
+        # field — it's derived as JV - LND_VAL in _fill_derived_metrics.
+        # These aliases cover county/PAPA layers that DO carry it.
         "IMP_VAL", "BLDG_VAL", "BUILDING_VAL", "BLDGVAL", "IMPRVAL",
         "IMPROVEMENT_VALUE", "IMPROV_VAL",
     ],

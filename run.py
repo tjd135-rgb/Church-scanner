@@ -121,9 +121,31 @@ def _dump_metadata(cfg) -> int:
         except ServiceError as e:
             print(f"  unavailable: {e}")
             continue
+        m = layer.metadata
         print(f"  url: {layer.url}")
-        print(f"  maxRecordCount: {layer.max_record_count}")
+        print(f"  name:               {m.get('name')!r}")
+        print(f"  type:               {m.get('type')!r}")
+        print(f"  geometryType:       {m.get('geometryType')!r}")
+        print(f"  objectIdField:      {m.get('objectIdField')!r}")
+        print(f"  capabilities:       {m.get('capabilities')!r}")
+        print(f"  supportedQueryFormats: {m.get('supportedQueryFormats')!r}")
+        print(f"  maxRecordCount:     {layer.max_record_count}")
         print(f"  supportsPagination: {layer.supports_pagination}")
+        print(f"  hasStaticData:      {m.get('hasStaticData')}")
+        print(f"  isDataVersioned:    {m.get('isDataVersioned')}")
+        print(f"  isView:             {m.get('isView')}")
+        print(f"  extent:             {m.get('extent')}")
+        adv = m.get("advancedQueryCapabilities") or {}
+        print(f"  advancedQueryCapabilities:")
+        for k in ("supportsPagination", "supportsQueryWithDistance",
+                  "supportsReturningQueryExtent", "supportsStatistics",
+                  "supportsOrderBy", "supportsDistinct", "supportsSqlExpression",
+                  "supportsHavingClause", "supportsCountDistinct",
+                  "supportsQueryAttachments", "supportsPercentileStatistics",
+                  "supportsQueryWithResultType", "supportsReturningGeometryCentroid",
+                  "supportsPaging"):
+            if k in adv:
+                print(f"    {k} = {adv[k]}")
         print(f"  fields:")
         for f in layer.metadata.get("fields", []) or []:
             print(f"    {f.get('name'):<32} {f.get('type'):<24} "
