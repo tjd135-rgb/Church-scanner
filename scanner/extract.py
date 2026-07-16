@@ -1,19 +1,23 @@
-"""Parcel extraction across three complementary passes.
+"""Parcel extraction: one bounded server-side query + three client-side passes.
 
-Pass A — Land-use codes: query parcels whose DOR_UC is 71 or 72, clipped to
-the city boundary polygons.
+The FGIO Statewide Cadastral service rejects any query that combines a
+WHERE clause with a geometry filter — verified in --probe-query L3d/L3e
+(200-err even with correctly-projected native-SR envelope). So we can't
+push both filters server-side. Strategy:
 
-Pass B — Spatial buffer: query parcels intersecting the buffered road
-corridor, then filter locally to DOR use codes 71/72 (some services only
-allow one geometry filter at a time, so we always filter server-side by
-geometry and client-side by use code to keep queries cheap).
+1. **Single server-side query**: DOR_UC IN (71,72) AND CO_NO IN (<target
+   counties>). Bounded by county so we don't paginate all-of-Florida
+   just to get 30k rows.
+2. **Three client-side passes** applied as flags on the returned frame:
+   - pass_land_use: parcel falls within any target city polygon (or the
+     corridor bbox fallback).
+   - pass_buffer: parcel intersects the buffered road corridor.
+   - pass_address: situs address string matches one of the highway
+     regex patterns.
+3. Keep any row with pass_land_use OR pass_buffer OR pass_address True.
 
-Pass C — Situs-address regex: query parcels whose situs address string
-matches one of the highway patterns AND whose DOR_UC is 71/72 — catches
-parcels the buffer missed due to centerline imprecision.
-
-Results from all three passes are unioned by parcel_id, with a `passes`
-column marking which passes hit each row.
+This is a superset of the original spec's "either method" union and
+handles the service's constraint cleanly.
 """
 from __future__ import annotations
 
@@ -117,14 +121,17 @@ def _fill_derived_bldg_val(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
 def _fill_lot_metrics(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """Fill lot_ac from lot_sf (or geometry) and vice-versa where missing."""
+    # Ensure both columns exist as float64 (not object/NA) so later
+    # .loc[mask] = <float> assignments don't upcast on write.
+    nan_col = pd.Series([float("nan")] * len(gdf), index=gdf.index, dtype="float64")
     if "lot_sf" in gdf.columns:
         gdf["lot_sf"] = pd.to_numeric(gdf["lot_sf"], errors="coerce")
     else:
-        gdf["lot_sf"] = pd.NA
+        gdf["lot_sf"] = nan_col.copy()
     if "lot_ac" in gdf.columns:
         gdf["lot_ac"] = pd.to_numeric(gdf["lot_ac"], errors="coerce")
     else:
-        gdf["lot_ac"] = pd.NA
+        gdf["lot_ac"] = nan_col.copy()
 
     # Fill acres from square feet where possible.
     mask = gdf["lot_ac"].isna() & gdf["lot_sf"].notna()
@@ -156,145 +163,109 @@ def _numeric_columns(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return gdf
 
 
-def extract_by_land_use(
+def query_target_parcels(
     client: ArcGISClient,
     layer: Layer,
-    city_polygons_4326: gpd.GeoDataFrame,
     dor_codes: list[int],
+    county_numbers: list[int],
 ) -> gpd.GeoDataFrame:
+    """Server-side WHERE-only query: DOR_UC IN (…) AND CO_NO IN (…).
+
+    Returns geometry in EPSG:4326 (client asks for outSR=4326). County
+    bounding keeps the payload manageable — statewide DOR 71/72 would
+    be ~30-50k rows; two counties trim that to a few thousand."""
     fm = layer.field_map
     dor_field = fm.get("dor_uc")
     if dor_field is None:
         raise RuntimeError(
-            f"layer {layer.url} exposes no DOR use-code field. Cannot filter "
-            f"by land use. field_map.unresolved={fm.unresolved}"
+            f"layer {layer.url} exposes no DOR use-code field. "
+            f"unresolved={fm.unresolved}"
         )
     where = _in_clause(layer, "dor_uc", dor_codes)
+    if county_numbers and fm.get("county"):
+        # CO_NO on the FGIO layer is esriFieldTypeDouble; _in_clause
+        # emits unquoted numeric literals for non-string fields.
+        where += " AND " + _in_clause(layer, "county", county_numbers)
 
-    # Union city polygons and hand them to the client, pre-projected to
-    # the layer's native SR. If the union is an axis-aligned rectangle
-    # (e.g. the corridor bbox fallback), the helper emits an envelope
-    # instead of a polygon.
-    target_wkid = native_wkid(layer)
-    esri_geom, geom_type = _cities_to_esri_geometry(
-        city_polygons_4326, target_wkid=target_wkid,
-    )
-
-    log.info("pass A (land use): querying %s where %s (inSR=%d)",
-             layer.url, where, target_wkid)
-    feats = client.query_all(
-        layer,
-        where=where,
-        geometry=esri_geom, geometry_type=geom_type,
-    )
-    log.info("pass A returned %d features", len(feats))
+    log.info("querying %s where %s", layer.url, where)
+    feats = client.query_all(layer, where=where)
+    log.info("server returned %d features", len(feats))
     gdf = _canonicalize(feats, fm)
-    gdf["pass_land_use"] = True
     return gdf
 
 
-def extract_by_buffer(
-    client: ArcGISClient,
-    layer: Layer,
-    corridor_buffer_3857: gpd.GeoSeries,
-    dor_codes: list[int] | None,
-) -> gpd.GeoDataFrame:
-    fm = layer.field_map
-    corridor_4326 = corridor_buffer_3857.to_crs("EPSG:4326")
-    target_wkid = native_wkid(layer)
-    esri_geom, geom_type = shapely_to_esri_geometry(
-        corridor_4326.geometry.iloc[0], target_wkid=target_wkid,
-    )
-    where = "1=1"
-    if dor_codes:
-        dor_field = fm.get("dor_uc")
-        if dor_field:
-            where = _in_clause(layer, "dor_uc", dor_codes)
-    log.info("pass B (buffer): querying %s where %s", layer.url, where)
-    feats = client.query_all(
-        layer, where=where, geometry=esri_geom,
-        geometry_type=geom_type,
-    )
-    log.info("pass B returned %d features", len(feats))
-    gdf = _canonicalize(feats, fm)
-    gdf["pass_buffer"] = True
-    return gdf
-
-
-def extract_by_address(
-    client: ArcGISClient,
-    layer: Layer,
+def apply_pass_flags(
+    gdf: gpd.GeoDataFrame,
     city_polygons_4326: gpd.GeoDataFrame,
+    corridor_buffer_3857: gpd.GeoSeries,
     address_patterns: list[str],
-    dor_codes: list[int],
 ) -> gpd.GeoDataFrame:
-    fm = layer.field_map
-    situs_field = fm.get("situs_addr")
-    dor_field = fm.get("dor_uc")
-    if situs_field is None or dor_field is None:
-        log.warning(
-            "pass C skipped: situs_addr=%s dor_uc=%s",
-            situs_field, dor_field,
+    """Add pass_land_use / pass_buffer / pass_address flags client-side.
+
+    - pass_land_use: parcel intersects any city polygon
+    - pass_buffer:   parcel intersects the buffered road corridor
+    - pass_address:  situs address string matches an address pattern
+    """
+    import re
+
+    if gdf.empty:
+        for c in ("pass_land_use", "pass_buffer", "pass_address"):
+            gdf[c] = False
+        return gdf
+
+    proj_parcels = gdf.to_crs("EPSG:3857")
+
+    # pass_land_use
+    if city_polygons_4326 is not None and not city_polygons_4326.empty:
+        from shapely.ops import unary_union
+        city_union_3857 = unary_union(
+            city_polygons_4326.to_crs("EPSG:3857").geometry.values
         )
-        return gpd.GeoDataFrame(columns=list(fm.mapping.keys()) + ["geometry"],
-                                geometry="geometry", crs="EPSG:4326")
+        gdf["pass_land_use"] = proj_parcels.geometry.intersects(city_union_3857).values
+    else:
+        gdf["pass_land_use"] = True  # no city constraint
 
-    like_clauses = " OR ".join(
-        f"UPPER({situs_field}) LIKE '%{p}%'" for p in address_patterns
-    )
-    codes_clause = _in_clause(layer, "dor_uc", dor_codes)
-    where = f"({like_clauses}) AND {codes_clause}"
+    # pass_buffer
+    if corridor_buffer_3857 is not None and len(corridor_buffer_3857):
+        buf = corridor_buffer_3857.iloc[0]
+        gdf["pass_buffer"] = proj_parcels.geometry.intersects(buf).values
+    else:
+        gdf["pass_buffer"] = False
 
-    target_wkid = native_wkid(layer)
-    esri_geom, geom_type = _cities_to_esri_geometry(
-        city_polygons_4326, target_wkid=target_wkid,
+    # pass_address
+    if "situs_addr" in gdf.columns and address_patterns:
+        addrs = gdf["situs_addr"].astype("string").str.upper().fillna("")
+        pattern = "|".join(re.escape(p) for p in address_patterns)
+        gdf["pass_address"] = addrs.str.contains(pattern, regex=True, na=False).values
+    else:
+        gdf["pass_address"] = False
+
+    log.info(
+        "pass counts: land_use=%d, buffer=%d, address=%d",
+        int(gdf["pass_land_use"].sum()),
+        int(gdf["pass_buffer"].sum()),
+        int(gdf["pass_address"].sum()),
     )
-    log.info("pass C (address): querying %s where %s (inSR=%d)",
-             layer.url, where, target_wkid)
-    feats = client.query_all(
-        layer, where=where, geometry=esri_geom,
-        geometry_type=geom_type,
-    )
-    log.info("pass C returned %d features", len(feats))
-    gdf = _canonicalize(feats, fm)
-    gdf["pass_address"] = True
     return gdf
 
 
-def merge_passes(*gdfs: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    non_empty = [g for g in gdfs if g is not None and not g.empty]
-    if not non_empty:
-        return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
-    all_cols = set().union(*(g.columns for g in non_empty))
-    for g in non_empty:
-        for c in ("pass_land_use", "pass_buffer", "pass_address"):
-            if c not in g.columns:
-                g[c] = False
-        for c in all_cols - set(g.columns):
-            g[c] = pd.NA
-    merged = pd.concat(non_empty, ignore_index=True)
-    merged = gpd.GeoDataFrame(merged, geometry="geometry",
-                              crs=non_empty[0].crs)
+def filter_to_any_pass(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Keep only rows caught by at least one pass."""
+    if gdf.empty:
+        return gdf
+    mask = (
+        gdf["pass_land_use"].fillna(False).astype(bool)
+        | gdf["pass_buffer"].fillna(False).astype(bool)
+        | gdf["pass_address"].fillna(False).astype(bool)
+    )
+    return gdf[mask].reset_index(drop=True)
 
-    def _agg(group: pd.DataFrame) -> pd.Series:
-        pick = group.iloc[0].copy()
-        pick["pass_land_use"] = bool(group["pass_land_use"].any())
-        pick["pass_buffer"] = bool(group["pass_buffer"].any())
-        pick["pass_address"] = bool(group["pass_address"].any())
-        return pick
 
-    if "parcel_id" not in merged.columns:
-        return merged
-    merged["parcel_id"] = merged["parcel_id"].astype("string").fillna("")
-    keyed = merged[merged["parcel_id"] != ""]
-    keyless = merged[merged["parcel_id"] == ""]
-    if len(keyed):
-        keyed = keyed.groupby("parcel_id", as_index=False, sort=False).apply(_agg)
-        keyed = keyed.reset_index(drop=True)
-    combined = pd.concat([keyed, keyless], ignore_index=True)
-    combined = gpd.GeoDataFrame(combined, geometry="geometry",
-                                crs=merged.crs)
-    combined = _numeric_columns(combined)
+def finalize_frame(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Numeric coercion + derived lot/bldg fields on the flagged frame."""
+    if gdf.empty:
+        return gdf
+    combined = _numeric_columns(gdf)
     combined = _fill_lot_metrics(combined)
     combined = _fill_derived_bldg_val(combined)
     return combined

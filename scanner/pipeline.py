@@ -80,22 +80,32 @@ def run(
     edges = roads_mod.load_road_centerlines(cfg.roads, cache_dir)
     corridor = roads_mod.build_corridor_buffer(edges, buf_ft)
 
-    # 4. Run the three extraction passes.
-    log.info("running extraction pass A (land use)")
-    a = extract_mod.extract_by_land_use(
-        client, parcel_layer, city_polys, cfg.dor_use_codes,
+    # 4. Server-side WHERE-only query, then three client-side passes.
+    # This service (FGIO Statewide Cadastral) rejects combined WHERE +
+    # geometry filters, so we can't push both server-side. Instead:
+    # bound by county server-side, apply spatial + address filters
+    # client-side. See scanner/extract.py docstring for details.
+    county_numbers = sorted({
+        int(c["fl_county_no"]) for c in cfg.cities
+        if c.get("fl_county_no") is not None
+    })
+    log.info("running server-side query bounded by counties %s",
+             county_numbers)
+    fetched = extract_mod.query_target_parcels(
+        client, parcel_layer, cfg.dor_use_codes, county_numbers,
     )
-    log.info("running extraction pass B (buffer + land use)")
-    b = extract_mod.extract_by_buffer(
-        client, parcel_layer, corridor, cfg.dor_use_codes,
+    if fetched.empty:
+        raise RuntimeError(
+            "server-side query returned no DOR 71/72 parcels — check "
+            "county numbers in config.yaml"
+        )
+    log.info("applying client-side pass flags")
+    flagged = extract_mod.apply_pass_flags(
+        fetched, city_polys, corridor, cfg.address_patterns,
     )
-    log.info("running extraction pass C (situs address regex)")
-    c = extract_mod.extract_by_address(
-        client, parcel_layer, city_polys, cfg.address_patterns,
-        cfg.dor_use_codes,
-    )
-    merged = extract_mod.merge_passes(a, b, c)
-    log.info("merged into %d unique parcels", len(merged))
+    merged = extract_mod.filter_to_any_pass(flagged)
+    merged = extract_mod.finalize_frame(merged)
+    log.info("kept %d parcels caught by at least one pass", len(merged))
 
     if merged.empty:
         log.error("no parcels matched — halting before metrics/export")
@@ -103,7 +113,8 @@ def run(
 
     merged["source_layer"] = parcel_layer.url
 
-    # 5. Flag proximity to buffer (client-side).
+    # 5. Flag proximity to buffer (used as a display field alongside
+    # pass_buffer — both mean the same thing, kept for compatibility).
     merged = extract_mod.spatial_flag_in_buffer(merged, corridor)
 
     # 6. Metrics + composite score.

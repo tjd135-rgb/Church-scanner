@@ -10,12 +10,19 @@ cities:
   - name: "Boca Raton"
     county: "Palm Beach"
     state: "FL"
+    # FGDL / FDOR county number. Broward = 6, Palm Beach = 50
+    # (alphabetical order across FL's 67 counties). Used to constrain
+    # the server-side WHERE clause to just these counties so we don't
+    # pull DOR 71/72 parcels statewide.
+    fl_county_no: 50
   - name: "Deerfield Beach"
     county: "Broward"
     state: "FL"
+    fl_county_no: 6
   - name: "Pompano Beach"
     county: "Broward"
     state: "FL"
+    fl_county_no: 6
 
 # Road corridors to buffer, expressed as OSM way name patterns. osmnx uses a
 # case-insensitive regex on the "name" and "ref" tags.
